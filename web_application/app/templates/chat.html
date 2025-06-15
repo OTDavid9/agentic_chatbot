@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Chat Dashboard</title>
+    <link rel="stylesheet" href="{{ url_for('static', path='style.css') }}">
+</head>
+<body>
+
+    <div class="header">
+        <h1>Welcome, {{ name }}!</h1>
+    </div>
+
+    <div class="container">
+
+        <form class="upload-form" action="/upload" method="post" enctype="multipart/form-data">
+            <label for="file">Upload Document:</label><br><br>
+            <input type="file" name="file" required>
+            <button type="submit">Upload</button>
+        </form>
+
+        <div class="chat-box" id="chat-box">
+            <p><em>Start chatting after uploading your document...</em></p>
+        </div>
+
+        <div class="chat-input">
+            <input type="text" id="message" placeholder="Type your message..." />
+            <button type="button" onclick="sendMessage()">Send</button>
+        </div>
+
+            <!-- Logout Button -->
+        <form action="/" method="get">
+            <button type="submit" class="logout-button">Logout</button>
+        </form>
+
+    </div>
+
+    <script>
+        function sendMessage() {
+            let messageInput = document.getElementById('message');
+            let chatBox = document.getElementById('chat-box');
+            let message = messageInput.value.trim();
+
+            if (message !== "") {
+                let newMessage = document.createElement('p');
+                newMessage.textContent = "You: " + message;
+                chatBox.appendChild(newMessage);
+                chatBox.scrollTop = chatBox.scrollHeight;
+                messageInput.value = "";
+            }
+        }
+    </script>
+
+</body>
+</html>

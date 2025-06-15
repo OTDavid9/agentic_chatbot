@@ -1,5 +1,6 @@
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Request
+from fastapi.responses import JSONResponse
 from openai import OpenAI
-import requests
 import json
 from chat_application.tools import ollama_tools
 from chat_application.functions import *
@@ -9,20 +10,32 @@ import logging
 from openai_client.client import client
 from dotenv import load_dotenv
 import os
+from typing import Dict, List, Optional
+from pydantic import BaseModel
 
 load_dotenv()
 
 # Constants
-FASTAPI_URL = os.getenv("FASTAPI_URL")
 MODEL_NAME = os.getenv("MODEL_NAME")
 
-# HTTP session for API requests
-session = requests.Session()
+app = FastAPI()
 
-# Initialize conversation history
-conversation_history = [
-    {"role": "system", "content": system_prompt},
-]
+# Store conversation histories per session
+conversation_histories: Dict[str, List[Dict]] = {}
+
+class ChatRequest(BaseModel):
+    message: str
+    session_id: Optional[str] = "default"
+
+class ChatResponse(BaseModel):
+    response: str
+    session_id: str
+
+def initialize_conversation(session_id: str):
+    """Initialize a new conversation history"""
+    conversation_histories[session_id] = [
+        {"role": "system", "content": system_prompt},
+    ]
 
 def process_tool_calls(tool_calls):
     """Process tool calls and return results using dynamic dispatch."""
@@ -53,59 +66,99 @@ def process_tool_calls(tool_calls):
 
     return tool_responses
 
-
-def chat_loop():
-    """Main chat loop for continuous conversation."""
-    global conversation_history
-
-    print("Starting conversation. Type 'quit' to exit.")
+async def handle_chat_message(session_id: str, user_input: str):
+    """Handle incoming chat message and generate response"""
+    if session_id not in conversation_histories:
+        initialize_conversation(session_id)
+    
+    conversation_history = conversation_histories[session_id]
+    user_input = user_input + " " + "/no_think"
+    conversation_history.append({"role": "user", "content": user_input})
 
     while True:
-        # Get user input
-        user_input = input("You: ")
-        if user_input.lower() == 'quit':
-            break
-        user_input = user_input + " " + "/no_think"
+        # Prepare messages: system prompt + last 10 items
+        truncated_conversation = [conversation_history[0]] + conversation_history[-10:]
 
-        # Add user message to history
-        conversation_history.append({"role": "user", "content": user_input})
+        # Get model response
+        response = client.chat.completions.create(
+            messages=truncated_conversation,
+            model=MODEL_NAME,
+            tools=ollama_tools,
+            tool_choice="auto",
+            temperature=0.9
+        )
 
-        # Continue conversation until no more tool calls are needed
+        message = response.choices[0].message
+        response_content = message.content.strip() if message.content else ""
+        clean_response = response_content.replace("<think>\n\n</think>", "").strip()
+
+        # Add assistant response to full history
+        assistant_message = {
+            "role": "assistant",
+            "content": clean_response,
+        }
+        if hasattr(message, 'tool_calls') and message.tool_calls:
+            assistant_message["tool_calls"] = message.tool_calls
+        
+        conversation_history.append(assistant_message)
+
+        # If there are tool calls, process them and continue
+        if hasattr(message, 'tool_calls') and message.tool_calls:
+            tool_responses = process_tool_calls(message.tool_calls)
+            conversation_history.extend(tool_responses)
+        else:
+            # No more tool calls, return response
+            return clean_response
+
+# WebSocket endpoint
+@app.websocket("/ws/{session_id}")
+async def websocket_endpoint(websocket: WebSocket, session_id: str):
+    await websocket.accept()
+    initialize_conversation(session_id)
+
+    try:
         while True:
-            # Prepare messages: system prompt + last 10 items
-            truncated_converstaion = [conversation_history[0]] + conversation_history[-10:]
+            # Receive user message
+            user_input = await websocket.receive_text()
+            
+            # Process message and get response
+            response = await handle_chat_message(session_id, user_input)
+            
+            # Send response back to client
+            await websocket.send_text(response)
+            
+    except WebSocketDisconnect:
+        # Clean up on disconnect
+        conversation_histories.pop(session_id, None)
+        logging.info(f"Client {session_id} disconnected")
 
-            # Get model response
-            response = client.chat.completions.create(
-                messages=truncated_converstaion,
-                model=MODEL_NAME,
-                tools=ollama_tools,
-                tool_choice="auto",
-                temperature=0.9
-            )
+# HTTP POST endpoints for testing
+@app.post("/chat", response_model=ChatResponse)
+async def http_chat_endpoint(chat_request: ChatRequest):
+    """HTTP endpoint for chat (for testing purposes)"""
+    response = await handle_chat_message(chat_request.session_id, chat_request.message)
+    return ChatResponse(response=response, session_id=chat_request.session_id)
 
-            message = response.choices[0].message
-            response = response.choices[0].message.content
-            response = response.strip()
+@app.post("/new_session")
+async def new_session(session_id: str = "default"):
+    """Initialize a new conversation session"""
+    initialize_conversation(session_id)
+    return {"message": f"New session {session_id} initialized", "session_id": session_id}
 
-            clean_response = response.replace("<think>\n\n</think>", "").strip()
+@app.get("/session_history")
+async def get_session_history(session_id: str = "default"):
+    """Get the conversation history for a session"""
+    if session_id not in conversation_histories:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return JSONResponse(content=conversation_histories[session_id])
 
-            # Add assistant response to full history
-            conversation_history.append({
-                "role": "assistant",
-                "content": clean_response,
-                "tool_calls": message.tool_calls if hasattr(message, 'tool_calls') else None
-            })
-
-            # If there are tool calls, process them and continue
-            if message.tool_calls:
-                tool_responses = process_tool_calls(message.tool_calls)
-                conversation_history.extend(tool_responses)
-            else:
-                # No more tool calls, display response and break
-                if message.content:
-                    print(f"Assistant: {clean_response}")
-                break
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"message": exc.detail},
+    )
 
 if __name__ == "__main__":
-    chat_loop()
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
